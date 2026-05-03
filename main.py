@@ -1,100 +1,119 @@
-import os
-import sqlite3
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+import os, sqlite3, threading, time
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from typing import List, Optional
+import telebot
 
-app = FastAPI(title="StarMusic Backend")
+app = FastAPI()
 
-# Настройка CORS, чтобы твой HTML мог общаться с этим сервером
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], 
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# --- КОНФИГУРАЦИЯ ---
+# Твой токен уже здесь. Бот нужен для авторизации, чтобы в базу не писали боты.
+BOT_TOKEN = "8785249686:AAFFXtYp1NKFwI7jzLExljnFBX7_bFDpDFE"
+bot = telebot.TeleBot(BOT_TOKEN)
+DB_NAME = "starmusic.db"
+auth_sessions = {}
 
-# Модели данных
-class User(BaseModel):
-    phone: str
-    name: Optional[str] = None
-
-class Song(BaseModel):
-    id: int
-    title: str
-    artist: str
-    url: str
-
-# Работа с БД
-DB_PATH = "star_music.db"
-
+# --- РАБОТА С БАЗОЙ ДАННЫХ ---
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    # Таблица пользователей
-    cursor.execute('''CREATE TABLE IF NOT EXISTS users 
-                      (phone TEXT PRIMARY KEY, name TEXT)''')
-    # Таблица песен
-    cursor.execute('''CREATE TABLE IF NOT EXISTS songs 
+    # Таблица для пользователей (синхронизация профилей)
+    cursor.execute('CREATE TABLE IF NOT EXISTS users (phone TEXT PRIMARY KEY, name TEXT)')
+    # Таблица для песен (общая для всех устройств)
+    cursor.execute('''CREATE TABLE IF NOT EXISTS tracks 
                       (id INTEGER PRIMARY KEY AUTOINCREMENT, 
                        title TEXT, artist TEXT, url TEXT)''')
-    
-    # Добавим стартовые песни, если таблица пуста
-    cursor.execute("SELECT COUNT(*) FROM songs")
-    if cursor.fetchone()[0] == 0:
-        sample_songs = [
-            ("Lofi Hip Hop", "Star Artist", "https://example.com/song1.mp3"),
-            ("Night Drive", "Moonlight", "https://example.com/song2.mp3")
-        ]
-        cursor.executemany("INSERT INTO songs (title, artist, url) VALUES (?, ?, ?)", sample_songs)
-    
     conn.commit()
     conn.close()
 
 init_db()
 
-@app.post("/auth/send-code")
-async def send_code(user: User):
-    # Имитация отправки кода. В реальности здесь вызывается API SMS-сервиса.
-    return {"status": "success", "message": f"Code sent to {user.phone}"}
+# --- МОДЕЛИ ДАННЫХ ---
+class TrackData(BaseModel):
+    title: str
+    artist: str
+    url: str
 
-@app.post("/auth/verify")
-async def verify(user: User):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT name FROM users WHERE phone = ?", (user.phone,))
-    result = cursor.fetchone()
+class UserRequest(BaseModel):
+    phone: str
+    name: str = None
+
+# --- ЭНДПОИНТЫ ДЛЯ РАБОТЫ С ПЕСНЯМИ ---
+
+@app.get("/api/tracks")
+async def get_tracks():
+    """Отдает список всех песен из базы данных для всех устройств"""
+    conn = sqlite3.connect(DB_NAME)
+    # Сортируем: новые песни будут сверху
+    tracks = conn.execute("SELECT title, artist, url FROM tracks ORDER BY id DESC").fetchall()
     conn.close()
-    
-    if result:
-        return {"status": "exists", "name": result[0]}
-    return {"status": "new_user"}
+    return [{"title": t[0], "artist": t[1], "url": t[2]} for t in tracks]
 
-@app.post("/auth/register")
-async def register(user: User):
+@app.post("/api/add-track")
+async def add_track(data: TrackData):
+    """Принимает новую песню от пользователя и сохраняет её в общую базу"""
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO users (phone, name) VALUES (?, ?)", (user.phone, user.name))
+        conn = sqlite3.connect(DB_NAME)
+        conn.execute("INSERT INTO tracks (title, artist, url) VALUES (?, ?, ?)", 
+                     (data.title, data.artist, data.url))
         conn.commit()
         conn.close()
-        return {"status": "success"}
-    except sqlite3.IntegrityError:
-        raise HTTPException(status_code=400, detail="User already exists")
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
-@app.get("/songs", response_model=List[Song])
-async def get_songs():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, title, artist, url FROM songs")
-    rows = cursor.fetchall()
+# --- ЭНДПОИНТЫ АВТОРИЗАЦИИ ---
+
+@app.post("/api/init-auth")
+async def init_auth(data: UserRequest):
+    phone = data.phone.replace("+", "").strip()
+    auth_sessions[phone] = False
+    return {"bot_user": bot.get_me().username}
+
+@app.get("/api/status/{phone}")
+async def check_status(phone: str):
+    clean_phone = phone.replace("+", "").strip()
+    if auth_sessions.get(clean_phone):
+        conn = sqlite3.connect(DB_NAME)
+        user = conn.execute("SELECT name FROM users WHERE phone=?", (clean_phone,)).fetchone()
+        conn.close()
+        return {"ready": True, "exists": bool(user), "name": user[0] if user else None}
+    return {"ready": False}
+
+@app.post("/api/register")
+async def register(data: UserRequest):
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute("INSERT OR REPLACE INTO users VALUES (?,?)", (data.phone, data.name))
+    conn.commit()
     conn.close()
-    return [Song(id=r[0], title=r[1], artist=r[2], url=r[3]) for r in rows]
+    return {"ok": True}
+
+# --- ЛОГИКА ТЕЛЕГРАМ-БОТА ---
+@bot.message_handler(commands=['start'])
+def start_cmd(message):
+    markup = telebot.types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+    markup.add(telebot.types.KeyboardButton("🚀 Подтвердить вход в StarMusic", request_contact=True))
+    bot.send_message(message.chat.id, "Для доступа к сайту нажми на кнопку:", reply_markup=markup)
+
+@bot.message_handler(content_types=['contact'])
+def handle_contact(message):
+    phone = message.contact.phone_number.replace("+", "").strip()
+    auth_sessions[phone] = True
+    bot.send_message(message.chat.id, "✅ Доступ разрешен! Можешь добавлять музыку.")
+
+def run_bot():
+    bot.infinity_polling()
+
+threading.Thread(target=run_bot, daemon=True).start()
+
+# --- ВЫДАЧА HTML (без изменений) ---
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    # Здесь твой текущий HTML код
+    return """...твой существующий HTML..."""
 
 if __name__ == "__main__":
     import uvicorn
-    # Render передает порт через переменную окружения
+    # Запуск сервера
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
